@@ -60,7 +60,8 @@ create_vm() {
     if VBoxManage showvminfo "$VM_NAME" &>/dev/null; then
         log_message "ERROR" "VM '$VM_NAME' already exists. Please remove it first."
         exit 1
-    }
+    fi
+
 
     # Create and configure VM
     VBoxManage createvm --name "$VM_NAME" --ostype "$VM_OS_TYPE" --register

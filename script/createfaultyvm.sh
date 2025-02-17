@@ -6,91 +6,189 @@ VM_DISK="FaultyLabVM.vdi"
 VM_RAM="2048"
 VM_CPUS="2"
 VM_OS_TYPE="Ubuntu_64"
-VM_ISO_PATH="/home/ubuntu/Downloads/ubuntu-22.04.1-desktop-amd64.iso" # Update this path with your Ubuntu ISO file
+VM_ISO_PATH="/home/ubuntu/Downloads/ubuntu-22.04.1-desktop-amd64.iso"
 VM_SNAPSHOT="FaultyBaseline"
+LOG_FILE="vm_creation.log"
 
-# Function to check if VBoxManage is installed
-check_vboxmanage() {
+# Logging function
+log_message() {
+    local level="$1"
+    local message="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" | tee -a "$LOG_FILE"
+}
+
+# Error handling function
+handle_error() {
+    local exit_code=$?
+    local command=$1
+    if [ $exit_code -ne 0 ]; then
+        log_message "ERROR" "Command '$command' failed with exit code $exit_code"
+        exit $exit_code
+    fi
+}
+
+# Function to check prerequisites
+check_prerequisites() {
+    log_message "INFO" "Checking prerequisites..."
+    
+    # Check VBoxManage
     if ! command -v VBoxManage &> /dev/null; then
-        echo "[ERROR] VBoxManage is not installed. Install VirtualBox and try again."
+        log_message "ERROR" "VBoxManage is not installed. Install VirtualBox and try again."
+        exit 1
+    fi
+
+    # Check ISO file exists
+    if [ ! -f "$VM_ISO_PATH" ]; then
+        log_message "ERROR" "Ubuntu ISO not found at $VM_ISO_PATH"
+        exit 1
+    fi
+
+    # Check disk space
+    local required_space=$((25*1024*1024)) # 25GB in KB
+    local available_space=$(df -k . | awk 'NR==2 {print $4}')
+    if [ $available_space -lt $required_space ]; then
+        log_message "ERROR" "Insufficient disk space. Need at least 25GB free."
         exit 1
     fi
 }
 
-# Step 1: Create VirtualBox VM
+# Function to create VirtualBox VM
 create_vm() {
-    echo "[INFO] Creating VirtualBox VM: $VM_NAME"
+    log_message "INFO" "Creating VirtualBox VM: $VM_NAME"
+    
+    # Check if VM already exists
+    if VBoxManage showvminfo "$VM_NAME" &>/dev/null; then
+        log_message "ERROR" "VM '$VM_NAME' already exists. Please remove it first."
+        exit 1
+    }
+
+    # Create and configure VM
     VBoxManage createvm --name "$VM_NAME" --ostype "$VM_OS_TYPE" --register
-    VBoxManage modifyvm "$VM_NAME" --memory "$VM_RAM" --cpus "$VM_CPUS" --nic1 nat
+    handle_error "createvm"
+
+    VBoxManage modifyvm "$VM_NAME" \
+        --memory "$VM_RAM" \
+        --cpus "$VM_CPUS" \
+        --nic1 nat \
+        --natpf1 "guestssl,tcp,,2222,,22" \
+        --vram 128 \
+        --graphicscontroller vmsvga \
+        --accelerate3d on \
+        --audio none \
+        --clipboard bidirectional
+    handle_error "modifyvm"
+
+    # Create and attach storage
     VBoxManage createhd --filename "$VM_DISK" --size 20000
+    handle_error "createhd"
+
     VBoxManage storagectl "$VM_NAME" --name "SATA Controller" --add sata --controller IntelAHCI
     VBoxManage storageattach "$VM_NAME" --storagectl "SATA Controller" --port 0 --device 0 --type hdd --medium "$VM_DISK"
     VBoxManage storagectl "$VM_NAME" --name "IDE Controller" --add ide
     VBoxManage storageattach "$VM_NAME" --storagectl "IDE Controller" --port 0 --device 0 --type dvddrive --medium "$VM_ISO_PATH"
     VBoxManage modifyvm "$VM_NAME" --boot1 dvd --boot2 disk
-    echo "[INFO] VirtualBox VM $VM_NAME created successfully!"
+
+    log_message "SUCCESS" "VM created successfully!"
 }
 
-# Step 2: Start the VM for initial installation
+# Function to start VM and wait for installation
 start_vm() {
-    echo "[INFO] Starting the VM for installation..."
+    log_message "INFO" "Starting VM for installation..."
     VBoxManage startvm "$VM_NAME" --type gui
-    echo "[INFO] Please complete the OS installation manually. Then shut down the VM."
+    
+    log_message "INFO" "Please complete the Ubuntu installation with these settings:"
+    echo "Username: ubuntu"
+    echo "Password: ubuntu"
+    echo "Hostname: faultylab"
+    echo "Enable SSH server during installation"
 }
 
-# Step 3: Create a snapshot after installation
+# Function to create snapshot
 create_snapshot() {
-    echo "[INFO] Taking a snapshot of the VM after installation..."
+    log_message "INFO" "Creating baseline snapshot..."
     VBoxManage snapshot "$VM_NAME" take "$VM_SNAPSHOT" --description "Baseline VM for Fault Injection"
-    echo "[INFO] Snapshot $VM_SNAPSHOT created successfully!"
+    handle_error "snapshot"
 }
 
-# Step 4: Inject Faults into the VM
+# Function to inject faults
 inject_faults() {
-    echo "[INFO] Injecting faults into the VM..."
+    log_message "INFO" "Starting fault injection process..."
     
-    # Copy the fault injection script to VM
-    VBoxManage guestcontrol "$VM_NAME" copyto --username ubuntu --password ubuntu \
-        "script/faults.sh" "/tmp/faults.sh"
-    
-    # Make the script executable
-    VBoxManage guestcontrol "$VM_NAME" run --username ubuntu --password ubuntu -- /bin/bash -c "chmod +x /tmp/faults.sh"
-    
-    # Start VM and wait for boot
+    # Wait for VM to be powered off
+    while VBoxManage showvminfo "$VM_NAME" | grep -q "running"; do
+        log_message "INFO" "Waiting for VM to be powered off..."
+        sleep 10
+    done
+
+    # Copy and execute fault script
     VBoxManage startvm "$VM_NAME" --type headless
-    sleep 60
+    sleep 60  # Wait for boot
 
-    # Execute the fault injection script with sudo
-    VBoxManage guestcontrol "$VM_NAME" run --username ubuntu --password ubuntu -- /bin/bash -c "sudo /tmp/faults.sh"
-    
-    # Clean up the script
-    VBoxManage guestcontrol "$VM_NAME" run --username ubuntu --password ubuntu -- /bin/bash -c "rm /tmp/faults.sh"
+    # Retry mechanism for guest control
+    local max_retries=5
+    local retry_count=0
+    local success=false
 
-    VBoxManage controlvm "$VM_NAME" poweroff
-    echo "[INFO] VM faults injected and powered off."
+    while [ $retry_count -lt $max_retries ] && [ "$success" = false ]; do
+        if VBoxManage guestcontrol "$VM_NAME" copyto --username ubuntu --password ubuntu \
+            "script/faults.sh" "/tmp/faults.sh"; then
+            success=true
+        else
+            retry_count=$((retry_count + 1))
+            log_message "WARNING" "Failed to copy script, attempt $retry_count of $max_retries"
+            sleep 10
+        fi
+    done
+
+    if [ "$success" = false ]; then
+        log_message "ERROR" "Failed to copy fault script after $max_retries attempts"
+        return 1
+    fi
+
+    # Execute fault script
+    VBoxManage guestcontrol "$VM_NAME" run --username ubuntu --password ubuntu -- /bin/bash -c "chmod +x /tmp/faults.sh && sudo /tmp/faults.sh"
+    handle_error "fault injection"
+
+    log_message "SUCCESS" "Faults injected successfully"
 }
 
-# Step 5: Export the Faulty VM
+# Function to export VM
 export_vm() {
-    echo "[INFO] Exporting the faulty VM as an OVA file..."
-    VBoxManage export "$VM_NAME" --output "${VM_NAME}_Faulty.ova"
-    echo "[INFO] Faulty VM exported successfully to ${VM_NAME}_Faulty.ova"
+    log_message "INFO" "Exporting faulty VM..."
+    local export_path="${VM_NAME}_Faulty.ova"
+    
+    VBoxManage export "$VM_NAME" --output "$export_path" --manifest --ovf20
+    handle_error "export"
+    
+    log_message "SUCCESS" "VM exported to $export_path"
 }
 
-# Main Execution
+# Cleanup function
+cleanup() {
+    log_message "INFO" "Performing cleanup..."
+    if [ -f "/tmp/faults.sh" ]; then
+        rm -f "/tmp/faults.sh"
+    fi
+}
+
+# Main execution with error handling
 main() {
-    check_vboxmanage
+    trap cleanup EXIT
+    
+    log_message "INFO" "Starting VM creation process..."
+    
+    check_prerequisites
     create_vm
     start_vm
 
-    echo "[INFO] Complete the installation of the OS in the VM. Then press Enter to continue."
-    read -p ""
+    log_message "INFO" "Waiting for installation completion..."
+    read -p "Press Enter once OS installation is complete and VM is shut down..."
 
     create_snapshot
     inject_faults
     export_vm
 
-    echo "[INFO] VM setup with faults completed successfully!"
+    log_message "SUCCESS" "VM setup completed successfully!"
 }
 
 main

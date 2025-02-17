@@ -191,5 +191,3 @@ main() {
 
     log_message "SUCCESS" "VM setup completed successfully!"
 }
-
-main
